@@ -88,7 +88,7 @@ DEFAULT_CONFIG = {
     "intercept_ctrl_v": True,      # 拦截 Excel 中的 Ctrl+V：剪贴板有图片时自动按规则插入
     "dblclick_preview": True,      # 双击 Excel 中的图片弹出大图预览
     "mode": "rowheight",           # fit | rowheight | fixed
-    "padding": 2,                  # 图片与单元格边缘留白（磅）
+    "padding": 3,                  # 图片与单元格边缘留白（磅），四边各留这么多
     "fixed_width": 120,            # 固定宽度模式的宽度（磅）
     "no_upscale": False,           # 小图不放大
 }
@@ -212,9 +212,11 @@ def do_paste(cfg, log):
             if cell.EntireRow.RowHeight < need:
                 cell.EntireRow.RowHeight = need
 
-        shape = ws.Shapes.AddPicture(
-            tmp, False, True,
-            float(cell.Left), float(cell.Top), w, h)
+        # 关键：图片不能贴死在单元格左上角，否则会压住左、上两条网格线。
+        # 锚点向内偏移 pad，配合已按 pad 收窄的宽高，四边留白才对称。
+        left = float(cell.Left) + pad
+        top = float(cell.Top) + pad
+        shape = ws.Shapes.AddPicture(tmp, False, True, left, top, w, h)
         # 收尾步骤单独隔离：即使失败，图片也已经插入成功
         try:
             shape.Placement = 1  # xlMoveAndSize，随单元格移动缩放
@@ -228,7 +230,7 @@ def do_paste(cfg, log):
             cell.Offset(1, 0).Select()  # 自动跳到下一行，方便连续粘贴
         except Exception as e:
             log(f"提示：跳转下一行失败（不影响插入）：{e}")
-        log(f"已插入图片 {iw}x{ih}px -> {w:.0f}x{h:.0f}磅 @ {cell.Address}")
+        log(f"已插入图片 {iw}x{ih}px -> {w:.0f}x{h:.0f}磅，四边留白 {pad:.0f}磅 @ {cell.Address}")
         return True
     except Exception as e:
         log(f"插入失败：{e}")
