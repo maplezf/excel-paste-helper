@@ -227,7 +227,16 @@ def do_paste(cfg, log):
         except Exception as e:
             file_log(f"缓存原图失败（仅影响双击预览清晰度）：{e}")
         try:
-            cell.Offset(1, 0).Select()  # 自动跳到下一行，方便连续粘贴
+            # 自动跳到下一行，方便连续粘贴。
+            # Offset(...).Select() 在部分 Excel / WPS 版本会抛 COM 异常，逐级降级
+            moved = False
+            try:
+                cell.Offset(1, 0).Select()
+                moved = True
+            except Exception:
+                pass
+            if not moved:
+                ws.Cells(int(cell.Row) + 1, int(cell.Column)).Select()
         except Exception as e:
             log(f"提示：跳转下一行失败（不影响插入）：{e}")
         log(f"已插入图片 {iw}x{ih}px -> {w:.0f}x{h:.0f}磅，四边留白 {pad:.0f}磅 @ {cell.Address}")
@@ -347,6 +356,19 @@ WM_KEYUP = 0x0101
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 CF_BITMAP, CF_DIB, CF_DIBV5 = 2, 8, 17
+CF_SYLK, CF_DIF = 4, 5
+CF_METAFILEPICT, CF_ENHMETAFILE, CF_UNICODETEXT = 3, 14, 13
+
+# Excel / WPS 复制"单元格内容"时特有的剪贴板格式。
+# 关键：复制单元格时 Excel 会在剪贴板里额外放一份位图（供不支持表格的程序降级使用），
+# 只看"有没有位图"会把单元格误判成图片。而这些表格格式只在复制表格数据时出现，
+# 复制图片（微信 / 截图 / 网页 / Excel 图片对象）绝不会带，据此可可靠区分。
+TABLE_FORMAT_NAMES = ("Biff12", "Biff8", "Biff5", "Biff4", "Biff3", "Biff",
+                      "XML Spreadsheet", "Csv", "Rich Text Format")
+
+# "图片文件"格式：只有复制真实图片（微信 / 截图 / 网页 / 图片文件）时才带，
+# 用于兜底判断时排除"其实是图片"的情况
+IMAGE_FILE_FORMAT_NAMES = ("PNG", "JFIF", "GIF", "image/png", "image/jpeg")
 DEBOUNCE_SEC = 0.8  # 按住不放 / 连按时防重复插入
 
 
@@ -383,6 +405,10 @@ def _setup_user32():
     u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                  wt.WPARAM, wt.LPARAM]
     u.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    u.RegisterClipboardFormatW.restype = wt.UINT
+    u.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+    u.IsClipboardFormatAvailable.restype = wt.BOOL
+    u.IsClipboardFormatAvailable.argtypes = [wt.UINT]
     return u
 
 
@@ -410,6 +436,43 @@ class KeyInterceptor:
         self._last_click = 0.0     # 上一次左键按下时间
         self._last_click_pos = (0, 0)
         self._suppress_up = False  # 吞掉配对的上抬事件
+        self._table_fmt_ids = (CF_SYLK, CF_DIF)  # 表格/文本类剪贴板格式 ID
+        self._imgfile_fmt_ids = ()               # 图片文件类剪贴板格式 ID
+
+    # -- 表格格式注册（用于区分"粘单元格"和"粘图片"） ------------------------
+    @staticmethod
+    def _reg_ids(u, names):
+        ids = []
+        for name in names:
+            try:
+                fid = int(u.RegisterClipboardFormatW(name))
+            except Exception:
+                fid = 0
+            if fid:
+                ids.append(fid)
+        return tuple(sorted(set(ids)))
+
+    def _register_table_formats(self):
+        u = self.user32
+        self._table_fmt_ids = tuple(sorted(set(
+            [CF_SYLK, CF_DIF] + list(self._reg_ids(u, TABLE_FORMAT_NAMES)))))
+        self._imgfile_fmt_ids = self._reg_ids(u, IMAGE_FILE_FORMAT_NAMES)
+        file_log(f"剪贴板格式识别已启用（表格 {len(self._table_fmt_ids)} 种 / "
+                 f"图片 {len(self._imgfile_fmt_ids)} 种）")
+
+    def _is_table_data(self, u):
+        """判断剪贴板内容是否为"单元格/表格数据"（而非图片）——必须快速返回"""
+        # 主判据：Excel 表格专有格式（Biff*、Csv、SYLK、DIF、RTF 等）
+        if any(u.IsClipboardFormatAvailable(f) for f in self._table_fmt_ids):
+            return True
+        # 兜底：带文本 + 带增强图元文件 + 不含任何图片文件格式
+        #      （覆盖不产生 Biff 格式的表格软件，如部分 WPS 版本）
+        if (u.IsClipboardFormatAvailable(CF_UNICODETEXT)
+                and u.IsClipboardFormatAvailable(CF_ENHMETAFILE)
+                and not any(u.IsClipboardFormatAvailable(f)
+                            for f in self._imgfile_fmt_ids)):
+            return True
+        return False
 
     # -- 快捷键解析 ----------------------------------------------------------
     def _parse(self, cfg):
@@ -471,24 +534,28 @@ class KeyInterceptor:
                     alt = u.GetAsyncKeyState(VK_MENU) & 0x8000
                     shift = u.GetAsyncKeyState(VK_SHIFT) & 0x8000
                     if ctrl and not alt and not shift:
-                        # 前台窗口是否为 Excel / WPS 表格
+                        # 1) 前台窗口必须是 Excel / WPS 表格
                         hwnd = u.GetForegroundWindow()
                         buf = ctypes.create_unicode_buffer(64)
                         u.GetClassNameW(hwnd, buf, 64)
-                        # 剪贴板是否有图片（快速检查，不打开剪贴板）
-                        has_img = any(
-                            u.IsClipboardFormatAvailable(f)
-                            for f in (CF_BITMAP, CF_DIB, CF_DIBV5))
-                        file_log(f"DEBUG Ctrl+V: 前台窗口类={buf.value!r} "
-                                 f"剪贴板有图={has_img}")
                         if buf.value in EXCEL_WND_CLASSES:
-                            if has_img:
-                                import time
-                                now = time.monotonic()
-                                if now - self._last_trigger > DEBOUNCE_SEC:
-                                    self._last_trigger = now
-                                    self.on_trigger("ctrlv")
-                                return 1  # 吞掉按键，阻止 Excel 原生粘贴
+                            # 2) 剪贴板若是"表格/文本数据"（复制单元格、复制文字），
+                            #    一律放行，交给 Excel 原生粘贴
+                            if self._is_table_data(u):
+                                file_log("Ctrl+V 放行：剪贴板为单元格/表格数据")
+                            else:
+                                # 3) 确认是真正的图片才接管
+                                has_img = any(
+                                    u.IsClipboardFormatAvailable(f)
+                                    for f in (CF_BITMAP, CF_DIB, CF_DIBV5))
+                                if has_img:
+                                    import time
+                                    now = time.monotonic()
+                                    if now - self._last_trigger > DEBOUNCE_SEC:
+                                        self._last_trigger = now
+                                        file_log("Ctrl+V 拦截：剪贴板为图片，按规则插入")
+                                        self.on_trigger("ctrlv")
+                                    return 1  # 吞掉按键，阻止 Excel 原生粘贴
             except Exception as e:
                 file_log(f"钩子异常: {e}")
         return self.user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -534,6 +601,7 @@ class KeyInterceptor:
         mod, vk = self._parse(cfg)
         self.intercept_ctrl_v = bool(cfg.get("intercept_ctrl_v", True))
         self.dblclick_preview = bool(cfg.get("dblclick_preview", True))
+        self._register_table_formats()
         self.running = True
         self.thread = threading.Thread(target=self._loop, args=(mod, vk), daemon=True)
         self.thread.start()
