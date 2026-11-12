@@ -135,6 +135,58 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+def ensure_excel_no_compress():
+    """关掉 Excel 的"保存时自动压缩图片"，否则插入的图会被降采样。
+
+    Excel 默认会按图片的显示尺寸重采样到约 220 ppi：
+    一张 2000x1500 的照片插进 45 磅宽的单元格后，只剩 138x103 像素，
+    在 Excel 里放大或打印就是糊的。
+    关掉后需重启 Excel 才生效。
+    返回 (ok, 说明文字)
+    """
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Office") as k:
+            vers, i = [], 0
+            while True:
+                try:
+                    name = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                i += 1
+                if name.replace(".", "").isdigit():
+                    vers.append(name)
+    except OSError:
+        return False, "未找到 Office 注册表（可能未安装微软 Office）"
+    if not vers:
+        return False, "未找到 Office 注册表（可能未安装微软 Office）"
+
+    changed = []
+    for v in vers:
+        path = r"Software\Microsoft\Office\%s\Excel\Options" % v
+        try:
+            with winreg.CreateKeyEx(
+                    winreg.HKEY_CURRENT_USER, path, 0,
+                    winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
+                try:
+                    cur, _ = winreg.QueryValueEx(
+                        k, "AutomaticPictureCompressionDefault")
+                except FileNotFoundError:
+                    cur = None
+                if cur != 0:
+                    winreg.SetValueEx(k, "AutomaticPictureCompressionDefault",
+                                      0, winreg.REG_DWORD, 0)
+                    changed.append(v)
+        except OSError:
+            continue
+
+    if changed:
+        return True, ("已关闭 Excel 图片自动压缩（Office %s），"
+                      "重启 Excel 后生效" % "/".join(changed))
+    return True, "Excel 图片自动压缩已处于关闭状态"
+
+
 # ---------------------------------------------------------------------------
 # 核心：取剪贴板图片 -> 插入 Excel
 # ---------------------------------------------------------------------------
@@ -212,11 +264,29 @@ def do_paste(cfg, log):
             if cell.EntireRow.RowHeight < need:
                 cell.EntireRow.RowHeight = need
 
-        # 关键：图片不能贴死在单元格左上角，否则会压住左、上两条网格线。
-        # 锚点向内偏移 pad，配合已按 pad 收窄的宽高，四边留白才对称。
+        # 关键 1：图片不能贴死在单元格左上角，否则会压住左、上两条网格线。
+        #         锚点向内偏移 pad，配合已按 pad 收窄的宽高，四边留白才对称。
         left = float(cell.Left) + pad
         top = float(cell.Top) + pad
-        shape = ws.Shapes.AddPicture(tmp, False, True, left, top, w, h)
+
+        # 关键 2：必须先按"原始像素尺寸"插入，再把显示尺寸改小。
+        #   Excel 在 AddPicture 的那一刻就会按传入的 Width/Height 重采样图片：
+        #   直接传 45 磅宽时，5712x4284 的手机照片会被压成 138x103 像素，
+        #   在 Excel 里放大或打印就会糊。先按 1 像素 = 72/96 磅插入
+        #   （不触发重采样），再用 Width/Height 缩放显示，原始分辨率完整保留。
+        raw_w = max(iw * 72.0 / 96.0, 1.0)
+        raw_h = max(ih * 72.0 / 96.0, 1.0)
+        cap = 12000.0  # Excel 图形尺寸上限约 169 英寸，留余量
+        if raw_w > cap or raw_h > cap:
+            k = min(cap / raw_w, cap / raw_h)
+            raw_w, raw_h = raw_w * k, raw_h * k
+        shape = ws.Shapes.AddPicture(tmp, False, True, left, top, raw_w, raw_h)
+        try:
+            shape.LockAspectRatio = 0   # msoFalse，允许宽高分别设置
+        except Exception:
+            pass
+        shape.Width = w
+        shape.Height = h
         # 收尾步骤单独隔离：即使失败，图片也已经插入成功
         try:
             shape.Placement = 1  # xlMoveAndSize，随单元格移动缩放
@@ -355,6 +425,8 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
+GA_ROOT = 2
+SM_CXDOUBLECLK, SM_CYDOUBLECLK = 36, 37
 CF_BITMAP, CF_DIB, CF_DIBV5 = 2, 8, 17
 CF_SYLK, CF_DIF = 4, 5
 CF_METAFILEPICT, CF_ENHMETAFILE, CF_UNICODETEXT = 3, 14, 13
@@ -409,6 +481,12 @@ def _setup_user32():
     u.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
     u.IsClipboardFormatAvailable.restype = wt.BOOL
     u.IsClipboardFormatAvailable.argtypes = [wt.UINT]
+    # 鼠标钩子给的是物理像素坐标，WindowFromPoint 在非 DPI 感知进程里按逻辑坐标
+    # 解释，会错位。WindowFromPhysicalPoint（Win8+）专治这个问题。
+    u.WindowFromPhysicalPoint.restype = ctypes.c_void_p
+    u.WindowFromPhysicalPoint.argtypes = [POINT]
+    u.GetAncestor.restype = ctypes.c_void_p
+    u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     return u
 
 
@@ -436,6 +514,7 @@ class KeyInterceptor:
         self._last_click = 0.0     # 上一次左键按下时间
         self._last_click_pos = (0, 0)
         self._suppress_up = False  # 吞掉配对的上抬事件
+        self._suppress_time = 0.0  # 上抬吞掉的时间戳（防止标志永久卡住）
         self._table_fmt_ids = (CF_SYLK, CF_DIF)  # 表格/文本类剪贴板格式 ID
         self._imgfile_fmt_ids = ()               # 图片文件类剪贴板格式 ID
 
@@ -489,38 +568,77 @@ class KeyInterceptor:
         self.user32.GetClassNameW(hwnd, buf, 64)
         return buf.value in EXCEL_WND_CLASSES, buf.value
 
+    def _is_excel_at(self, x, y):
+        """点击位置是否落在 Excel 窗口上（即便 Excel 此刻不是前台窗口）。
+        x, y 为鼠标钩子给出的物理像素坐标。"""
+        if self._is_excel_foreground()[0]:
+            return True
+        try:
+            hwnd = self.user32.WindowFromPhysicalPoint(POINT(int(x), int(y)))
+            if not hwnd:
+                return False
+            root = self.user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+            buf = ctypes.create_unicode_buffer(64)
+            self.user32.GetClassNameW(root, buf, 64)
+            return buf.value in EXCEL_WND_CLASSES
+        except Exception:
+            return False
+
     # -- 低级鼠标钩子回调（必须快速返回，不做 COM） --------------------------
     def _mouse_proc(self, nCode, wParam, lParam):
-        if nCode == 0:
-            try:
-                if wParam == WM_LBUTTONUP and self._suppress_up:
+        u = self.user32
+        if nCode != 0 or wParam not in (WM_LBUTTONDOWN, WM_LBUTTONUP):
+            return u.CallNextHookEx(None, nCode, wParam, lParam)
+        try:
+            import time
+            now = time.monotonic()
+            ms = ctypes.cast(ctypes.c_void_p(lParam),
+                             ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            x, y = ms.pt.x, ms.pt.y
+
+            if wParam == WM_LBUTTONUP:
+                if self._suppress_up and (now - self._suppress_time) < 1.0:
                     self._suppress_up = False
                     return 1  # 吞掉双击的第二下上抬
-                if wParam == WM_LBUTTONDOWN:
-                    if self._suppress_up:
-                        self._suppress_up = False
-                        return 1
-                    if self.dblclick_preview:
-                        ms = ctypes.cast(ctypes.c_void_p(lParam),
-                                         ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                        x, y = ms.pt.x, ms.pt.y
-                        import time
-                        now = time.monotonic()
-                        dbl_time = self.user32.GetDoubleClickTime() / 1000.0
-                        dx = abs(x - self._last_click_pos[0])
-                        dy = abs(y - self._last_click_pos[1])
-                        if (now - self._last_click) <= dbl_time and dx <= 6 and dy <= 6:
-                            self._last_click = 0.0
-                            is_excel, _cls = self._is_excel_foreground()
-                            if is_excel:
-                                self._suppress_up = True
-                                self.on_trigger("dblclick")
-                                return 1  # 吞掉第二下按下
-                        self._last_click = now
-                        self._last_click_pos = (x, y)
-            except Exception:
-                pass
-        return self.user32.CallNextHookEx(None, nCode, wParam, lParam)
+                self._suppress_up = False
+                return u.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # ---- 左键按下 ----
+            if self._suppress_up and (now - self._suppress_time) < 1.0:
+                # 这是上一轮双击被吞掉的第二下。即使吞掉也要更新点击记录，
+                # 否则下一次双击时 _last_click 仍是旧值，判据永远不成立
+                self._last_click = now
+                self._last_click_pos = (x, y)
+                return 1
+            self._suppress_up = False
+
+            if self.dblclick_preview:
+                dbl_time = u.GetDoubleClickTime() / 1000.0
+                # 阈值取系统双击范围，并按 DPI 换算为物理像素。
+                # 硬编码 6px 在 200% 缩放下只有 3 逻辑像素，手一抖就失败。
+                try:
+                    dpi = u.GetDpiForSystem() or 96
+                except Exception:
+                    dpi = 96
+                k = dpi / 96.0
+                cx = max(6, int(u.GetSystemMetrics(SM_CXDOUBLECLK) * k))
+                cy = max(6, int(u.GetSystemMetrics(SM_CYDOUBLECLK) * k))
+                dx = abs(x - self._last_click_pos[0])
+                dy = abs(y - self._last_click_pos[1])
+                hit = ((now - self._last_click) <= dbl_time
+                       and dx <= cx and dy <= cy)
+                self._last_click = now
+                self._last_click_pos = (x, y)
+                if hit:
+                    if self._is_excel_at(x, y):
+                        self._suppress_up = True
+                        self._suppress_time = now
+                        self.on_trigger("dblclick")
+                        return 1  # 吞掉第二下按下
+                    file_log("双击未触发：点击位置不在 Excel 窗口上")
+        except Exception:
+            pass
+        return u.CallNextHookEx(None, nCode, wParam, lParam)
 
     # -- 低级键盘钩子回调（必须快速返回） ------------------------------------
     def _hook_proc(self, nCode, wParam, lParam):
@@ -709,6 +827,11 @@ class App:
 
         self.hotkey = KeyInterceptor(lambda v: self.queue.append(v))
         self.hotkey.start(self.cfg)
+        try:
+            _ok, _msg = ensure_excel_no_compress()
+            self.log(_msg)
+        except Exception as _e:
+            self.log(f"检查 Excel 图片压缩设置失败：{_e}")
         self.root.after(60, self.poll)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
