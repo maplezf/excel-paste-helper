@@ -13,6 +13,7 @@ Excel 图片粘贴助手
 
 import ctypes
 import ctypes.wintypes as wt
+import io
 import json
 import os
 import sys
@@ -81,6 +82,7 @@ LOG_PATH = os.path.join(APP_DIR, "log.txt")
 CACHE_DIR = os.path.join(APP_DIR, "cache")          # 原图缓存，供双击预览用
 CACHE_INDEX = os.path.join(CACHE_DIR, "index.json")
 CACHE_MAX = 400                                     # 缓存条目上限
+AMBIGUOUS_MARK = "!AMBIGUOUS"                       # 索引里表示"此键有多个候选"
 
 DEFAULT_CONFIG = {
     "hotkey_mod": "ctrl+alt",      # ctrl+alt / ctrl+shift / alt
@@ -293,7 +295,15 @@ def do_paste(cfg, log):
         except Exception as e:
             log(f"提示：设置图片随单元格移动失败（不影响插入）：{e}")
         try:
-            cache_original_image(img, ws.Parent.Name, ws.Name, shape.Name)
+            # 把原图存进缓存，并把缓存文件名写进图形的"替代文字"。
+            # 这样标记随图片一起存进 xlsx —— 另存为改名、关掉重开、
+            # 甚至换电脑把 cache 目录一起拷过去，双击预览都能找回原图。
+            fname = cache_original_image(img, ws.Parent.Name, ws.Name, shape.Name)
+            if fname:
+                try:
+                    shape.AlternativeText = "EPH|%s|%dx%d" % (fname, iw, ih)
+                except Exception:
+                    pass
         except Exception as e:
             file_log(f"缓存原图失败（仅影响双击预览清晰度）：{e}")
         try:
@@ -333,26 +343,209 @@ def get_selected_picture_image(log):
     if not (hasattr(sel, "Width") and hasattr(sel, "Height")):
         return None, "当前选中的不是图片"
 
-    # 优先取插入时缓存的原图（分辨率最高、最清晰）
+    # ① 首选：插入时写进"替代文字"的缓存标记。
+    #    这是唯一随图片存进 xlsx 的线索，另存为改名 / 关掉重开都能命中。
     try:
-        ws_obj = sel.Parent
-        wb_obj = ws_obj.Parent
-        cached = lookup_cached_image(wb_obj.Name, ws_obj.Name, sel.Name)
-        if cached is not None:
-            return cached, "ok-原图缓存"
+        tag = str(sel.AlternativeText or "").strip()
+        if tag.startswith("EPH|"):
+            parts = tag.split("|")
+            if len(parts) >= 2:
+                im = _open_cached(parts[1].strip())
+                if im is not None:
+                    return im, "ok-原图缓存(标记)"
+                log("原图缓存文件已丢失，尝试其它方式")
     except Exception:
         pass
 
-    # 回退：把图片复制到剪贴板再读（只有屏幕分辨率，会偏糊）
+    # ② 其次：查索引（含另存为改名后的宽松匹配）
+    try:
+        ws_obj = sel.Parent
+        wb_obj = ws_obj.Parent
+        fname = lookup_cached_fname(wb_obj.Name, ws_obj.Name, sel.Name)
+        if fname:
+            im = _open_cached(fname)
+            if im is not None:
+                # 老版本插入的图没有标记，这里顺手补写一个，
+                # 下次打开（哪怕再改名）就不用再靠猜了
+                try:
+                    iw, ih = im.size
+                    sel.AlternativeText = "EPH|%s|%dx%d" % (fname, iw, ih)
+                except Exception:
+                    pass
+                return im, "ok-原图缓存(索引)"
+    except Exception:
+        pass
+
+    # ③ 再次：直接从已保存的 xlsx 包里解出这张图的内嵌原图。
+    #    完全不依赖 cache —— 换电脑、清过缓存、只拷走一个文件都能用。
+    try:
+        im = _image_from_xlsx_media(sel)
+        if im is not None:
+            return im, "ok-xlsx内嵌原图"
+    except Exception:
+        pass
+
+    # ④ 兜底 1：Excel 复制图片时，剪贴板里可能带一份原图 PNG
+    try:
+        sel.Copy()
+        _time.sleep(0.25)
+        data = _clipboard_png_bytes()
+        if data:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            if min(im.size) >= 64:
+                return im, "ok-剪贴板PNG"
+    except Exception:
+        pass
+
+    # ⑤ 兜底 2：屏幕分辨率截图。拿到的只是图片"显示尺寸"的位图，
+    #    一张 45 磅宽的图只有 20x11 像素，放大就是一坨马赛克。
+    #    所以低于 64 像素直接判定失败，宁可明确报错也不弹糊图。
     try:
         sel.CopyPicture(1, 2)          # xlScreen, xlBitmap
         _time.sleep(0.3)
         img = ImageGrab.grabclipboard()
         if isinstance(img, Image.Image):
+            if min(img.size) < 64:
+                return None, ("没找到这张图的原图缓存（只能取到 %dx%d 的屏幕缩略图）。"
+                              "原图缓存在程序目录的 cache 文件夹里，"
+                              "请确认没有删除它，且是在插入图片的那台电脑上预览"
+                              % img.size)
             return img, "ok-剪贴板"
         return None, "已选中图片，但读取图像数据失败"
     except Exception as e:
         return None, f"读取图片失败：{e}"
+
+
+def _update_rels(xml):
+    """解析 .rels 里的 <Relationship>，返回 [{'Id':..,'Target':..,'Type':..}]"""
+    import re as _re
+    out = []
+    for m in _re.finditer(r"<Relationship\b([^>]*)/?>", xml):
+        d = {}
+        for am in _re.finditer(r'(\w+)="([^"]*)"', m.group(1)):
+            d[am.group(1)] = am.group(2)
+        out.append(d)
+    return out
+
+
+def _rel_path(p):
+    """xl/drawings/drawing1.xml -> xl/drawings/_rels/drawing1.xml.rels"""
+    d, f = p.rsplit("/", 1)
+    return "%s/_rels/%s.rels" % (d, f)
+
+
+def _norm_zip_path(target):
+    """把 rels 里的相对 Target 规范成 zip 内的绝对路径"""
+    target = target.replace("\\", "/")
+    while target.startswith("../"):
+        target = target[3:]
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return "xl/" + target
+
+
+def _image_from_xlsx_media(sel):
+    """直接从已保存的 xlsx/xlsm 包里解出这张图对应的原始媒体文件。
+
+    完全不依赖 cache —— 换电脑、清过缓存、拷走单个文件，都能取回原图。
+    解析链路：workbook.xml -> sheetN.xml -> drawingN.xml -> media/imageN.*
+
+    定位这一张图时不能用 Shape.Name：中文版 Excel 的 COM 返回英文
+    "Picture 2"，而文件里存的是本地化名"图片 2"，两者对不上。
+    所以优先用我们写进"替代文字"的 EPH 标记（唯一且不随语言变），
+    其次用 Shape.ID 对应 XML 里的 cNvPr id。
+    失败返回 None（任何一步对不上都安静放弃，交给后面的兜底）。
+    """
+    import re as _re
+    import zipfile
+    try:
+        ws = sel.Parent
+        wb = ws.Parent
+        path = str(wb.FullName or "")
+        if not os.path.exists(path):
+            return None
+        if not path.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+            return None
+        ws_name = str(ws.Name)
+        marker = ""
+        shape_id = None
+        try:
+            marker = str(getattr(sel, "AlternativeText", "") or "").strip()
+        except Exception:
+            marker = ""
+        try:
+            shape_id = int(sel.ID)
+        except Exception:
+            shape_id = None
+
+        with zipfile.ZipFile(path) as z:
+            wbxml = z.read("xl/workbook.xml").decode("utf-8", "ignore")
+            # 按工作表名找 r:id（比用 Index 猜 sheetN.xml 可靠）
+            m = _re.search(
+                r'<sheet\b[^>]*\bname="%s"[^>]*\br:id="(rId\d+)"' % _re.escape(ws_name),
+                wbxml)
+            if not m:
+                return None
+            wb_rels = _update_rels(
+                z.read("xl/_rels/workbook.xml.rels").decode("utf-8", "ignore"))
+            sheet_target = None
+            for r in wb_rels:
+                if r.get("Id") == m.group(1):
+                    sheet_target = r.get("Target")
+                    break
+            if not sheet_target:
+                return None
+            sheet_path = _norm_zip_path(sheet_target)
+
+            # 工作表 -> drawing
+            s_rels = _update_rels(
+                z.read(_rel_path(sheet_path)).decode("utf-8", "ignore"))
+            draw_target = None
+            for r in s_rels:
+                if "/drawing" in (r.get("Type") or ""):
+                    draw_target = r.get("Target")
+                    break
+            if not draw_target:
+                return None
+            draw_path = _norm_zip_path(draw_target)
+            draw_xml = z.read(draw_path).decode("utf-8", "ignore")
+
+            # drawing 里定位到这一张图
+            blip = None
+            for pm in _re.finditer(r"<xdr:pic\b.*?</xdr:pic>", draw_xml, _re.S):
+                blk = pm.group(0)
+                hit = False
+                if marker and marker in blk:
+                    hit = True            # 自己写的标记，唯一且不受语言影响
+                elif shape_id is not None:
+                    nm = _re.search(r'<xdr:cNvPr\b[^>]*\bid="(\d+)"', blk)
+                    if nm and int(nm.group(1)) == shape_id:
+                        hit = True
+                if hit:
+                    bm = _re.search(r'<a:blip\b[^>]*\br:embed="([^"]+)"', blk)
+                    if bm:
+                        blip = bm.group(1)
+                        break
+            if not blip:
+                return None
+
+            d_rels = _update_rels(
+                z.read(_rel_path(draw_path)).decode("utf-8", "ignore"))
+            media_target = None
+            for r in d_rels:
+                if r.get("Id") == blip:
+                    media_target = r.get("Target")
+                    break
+            if not media_target:
+                return None
+            data = z.read(_norm_zip_path(media_target))
+
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        return im
+    except Exception:
+        return None
 
 
 def _load_cache_index():
@@ -372,29 +565,8 @@ def _save_cache_index(idx):
         pass
 
 
-def cache_original_image(img, wb_name, ws_name, shape_name):
-    """插入图片时把原图存进缓存，双击预览时就能用原始分辨率"""
-    import time as _time
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    fname = f"img_{int(_time.time() * 1000)}.png"
-    img.save(os.path.join(CACHE_DIR, fname), "PNG")
-    idx = _load_cache_index()
-    idx[f"{wb_name}|{ws_name}|{shape_name}"] = fname
-    # 超出上限时，删掉最旧的
-    if len(idx) > CACHE_MAX:
-        for k in list(idx.keys())[:len(idx) - CACHE_MAX]:
-            old = idx.pop(k, None)
-            if old:
-                try:
-                    os.remove(os.path.join(CACHE_DIR, old))
-                except Exception:
-                    pass
-    _save_cache_index(idx)
-
-
-def lookup_cached_image(wb_name, ws_name, shape_name):
-    idx = _load_cache_index()
-    fname = idx.get(f"{wb_name}|{ws_name}|{shape_name}")
+def _open_cached(fname):
+    """按缓存文件名打开原图，失败返回 None"""
     if not fname:
         return None
     path = os.path.join(CACHE_DIR, fname)
@@ -406,6 +578,119 @@ def lookup_cached_image(wb_name, ws_name, shape_name):
         return im
     except Exception:
         return None
+
+
+def _clipboard_png_bytes():
+    """读剪贴板里的 PNG 原始字节（Excel 复制图形时有时会提供该格式）"""
+    try:
+        import win32clipboard
+    except Exception:
+        return None
+    try:
+        win32clipboard.OpenClipboard()
+    except Exception:
+        return None
+    try:
+        try:
+            fmt = win32clipboard.RegisterClipboardFormat("PNG")
+        except Exception:
+            return None
+        if not fmt or not win32clipboard.IsClipboardFormatAvailable(fmt):
+            return None
+        data = win32clipboard.GetClipboardData(fmt)
+        return bytes(data) if data else None
+    except Exception:
+        return None
+    finally:
+        try:
+            win32clipboard.CloseClipboard()
+        except Exception:
+            pass
+
+
+def cache_original_image(img, wb_name, ws_name, shape_name):
+    """插入图片时把原图存进缓存，双击预览时就能用原始分辨率。
+
+    索引同时写三套 key：
+      wb|ws|shape   —— 传统 key，但工作簿"另存为"后名字会变，最不可靠
+      ws|shape      —— 去掉工作簿名，改名后仍可用
+      <文件名>      —— 供"替代文字"标记直接定位
+    返回缓存文件名（失败返回 None）。
+    """
+    import time as _time
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fname = "img_%d.png" % int(_time.time() * 1000)
+        img.save(os.path.join(CACHE_DIR, fname), "PNG")
+    except Exception:
+        return None
+    try:
+        idx = _load_cache_index()
+        idx["%s|%s|%s" % (wb_name, ws_name, shape_name)] = fname
+        # 不含工作簿名的 key：多个工作簿有同名图时会互相覆盖，
+        # 一旦发现冲突就打上歧义标记，宁可查不到也不张冠李戴
+        ws_key = "%s|%s" % (ws_name, shape_name)
+        prev = idx.get(ws_key)
+        if prev and prev != fname:
+            idx[ws_key] = AMBIGUOUS_MARK
+        else:
+            idx[ws_key] = fname
+        idx[fname] = fname
+        _save_cache_index(idx)
+    except Exception:
+        pass
+    _prune_cache()
+    return fname
+
+
+def _prune_cache():
+    """缓存文件超过上限时删最旧的（按文件数算，不再按索引条目数）"""
+    try:
+        files = [f for f in os.listdir(CACHE_DIR)
+                 if f.startswith("img_") and f.endswith(".png")]
+    except OSError:
+        return
+    if len(files) <= CACHE_MAX:
+        return
+    try:
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(CACHE_DIR, f)))
+    except OSError:
+        return
+    dead = set(files[:len(files) - CACHE_MAX])
+    for f in dead:
+        try:
+            os.remove(os.path.join(CACHE_DIR, f))
+        except OSError:
+            pass
+    try:
+        idx = {k: v for k, v in _load_cache_index().items() if v not in dead}
+        _save_cache_index(idx)
+    except Exception:
+        pass
+
+
+def lookup_cached_fname(wb_name, ws_name, shape_name):
+    """按 工作簿|工作表|图片名 找缓存文件名；工作簿改过名时用宽松匹配兜底"""
+    idx = _load_cache_index()
+    for key in ("%s|%s|%s" % (wb_name, ws_name, shape_name),
+                "%s|%s" % (ws_name, shape_name)):
+        fn = idx.get(key)
+        if fn and os.path.exists(os.path.join(CACHE_DIR, fn)):
+            return fn
+    # 兜底：另存为改名后工作簿名对不上，用"|工作表|图片名"后缀匹配。
+    # 只有唯一命中才采用，多个候选宁可放弃也不张冠李戴。
+    suffix = "|%s|%s" % (ws_name, shape_name)
+    hits = {v for k, v in idx.items()
+            if k.endswith(suffix) and v != AMBIGUOUS_MARK}
+    if len(hits) == 1:
+        fn = hits.pop()
+        if os.path.exists(os.path.join(CACHE_DIR, fn)):
+            return fn
+    return None
+
+
+def lookup_cached_image(wb_name, ws_name, shape_name):
+    return _open_cached(lookup_cached_fname(wb_name, ws_name, shape_name))
 
 
 # ---------------------------------------------------------------------------
